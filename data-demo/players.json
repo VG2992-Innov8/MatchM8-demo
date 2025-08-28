@@ -1,0 +1,14 @@
+[
+  {
+    "id": "58f1fdb8-9199-4e61-8403-95742205e909",
+    "name": "Vince",
+    "pin_hash": "$2a$10$YdnGFNFWgBpxUQn/OPzQ3e7zZmnzs34nriSd9SKXOh.n/7k85Upc2",
+    "pin_updated_at": "2025-08-27T22:45:32.098Z"
+  },
+  {
+    "id": "46db7276-59dd-46ef-866e-acb96fccfc69",
+    "name": "Toby",
+    "pin_hash": "$2a$10$hVUUMBEffrlmO9rrObKnuOtN.yb6cOt8/HgZPmJErL6gpJ9sdKyVG",
+    "pin_updated_at": "2025-08-27T22:45:44.718Z"
+  }
+]

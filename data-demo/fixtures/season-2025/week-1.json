@@ -1,0 +1,14 @@
+[
+  {
+    "id": "fixture_liverpool_southampton",
+    "home": "liverpool",
+    "away": "Southampton",
+    "kickoff_iso": "2025-08-27T22:50:00.000Z"
+  },
+  {
+    "id": "fixture_man_utd_chelsea",
+    "home": "man utd",
+    "away": "chelsea",
+    "kickoff_iso": "2025-08-27T22:50:00.000Z"
+  }
+]

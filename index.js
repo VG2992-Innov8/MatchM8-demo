@@ -21,13 +21,14 @@ if (process.env.LICENSE_PUBKEY_B64) {
   process.env.LICENSE_PUBKEY_B64 = cleanToken(process.env.LICENSE_PUBKEY_B64);
 }
 const APP_MODE = process.env.APP_MODE || 'demo';
-// demo guard: allow running without license in the demo copy
+// demo guard: allow running without license when explicitly set
 const SKIP_LICENSE = String(process.env.DEMO_SKIP_LICENSE || '').toLowerCase() === 'true';
 
 // ------------- App bootstrap -------------
 const express = require('express');
 const cors = require('cors');
 const cookieParser = require('cookie-parser');
+const crypto = require('crypto');
 const { DATA_DIR } = require('./lib/paths');     // <- central data dir (env DATA_DIR or ./data)
 
 const app = express();
@@ -63,10 +64,17 @@ function writeConfig(cfg) {
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
 }
 
-// simple admin-token guard for non-/api/admin routes
+// timing-safe admin-token guard (used only where needed)
+function timingSafeEqual(a = '', b = '') {
+  const A = Buffer.from(a);
+  const B = Buffer.from(b);
+  if (A.length !== B.length) return false;
+  try { return crypto.timingSafeEqual(A, B); } catch { return false; }
+}
 function requireAdminToken(req, res, next) {
-  const t = cleanToken(req.headers['x-admin-token'] || '');
-  if (!t || t !== (process.env.ADMIN_TOKEN || '')) {
+  const token = cleanToken(req.headers['x-admin-token'] || '');
+  const expected = process.env.ADMIN_TOKEN || '';
+  if (!token || !expected || !timingSafeEqual(token, expected)) {
     return res.status(401).json({ ok: false, error: 'invalid admin token' });
   }
   next();
@@ -83,16 +91,16 @@ app.get('/api/license/status', (_req, res) => res.json(license.getStatus()));
 // PUBLIC admin-auth endpoints (allowed even if license invalid)
 const ADMIN_PUBLIC = new Set(['/login', '/bootstrap', '/state', '/health']);
 
-// helpful boot log so you can see the bypass is active
-if (SKIP_LICENSE) console.log('DEMO_SKIP_LICENSE=true - bypassing license checks for /api/admin and /api/scores');
+if (SKIP_LICENSE) {
+  console.log('DEMO_SKIP_LICENSE=true — bypassing license checks for /api/admin and /api/scores');
+}
 
+// Gate /api/admin by license (NOT by admin token here; token is enforced inside the admin routers)
 app.use('/api/admin', (req, res, next) => {
   // allow public admin endpoints through this gate
   if (ADMIN_PUBLIC.has(req.path)) return next();
-
   // demo bypass: skip license check entirely
   if (SKIP_LICENSE) return next();
-
   // otherwise license must be valid
   const s = license.getStatus();
   if (!s.ok) return res.status(403).json({ error: 'License invalid: ' + s.reason });
@@ -278,11 +286,16 @@ if (admin.ok) {
 app.get('/api/__health', (_req, res) => res.json({ ok: true, mounted, mode: APP_MODE, dataDir: DATA_DIR }));
 app.get('/api/__routes', (_req, res) => res.json(mounted));
 
-/* -------------------- Map legacy UI pages -------------------- */
-['Part_A_PIN.html', 'Part_B_Predictions.html', 'Part_D_Scoring.html', 'Part_E_Season.html']
-  .forEach(page => {
-    app.get('/' + page, (_req, res) => res.sendFile(joinRepo('public', page)));
-  });
+/* -------------------- Map UI pages -------------------- */
+[
+  'Part_A_PIN.html',
+  'Part_B_Predictions.html',
+  'Part_D_Scoring.html',
+  'Part_E_Season.html',
+  'Part_E_Matrix.html',           // ⬅️ new matrix page
+].forEach(page => {
+  app.get('/' + page, (_req, res) => res.sendFile(joinRepo('public', page)));
+});
 
 /* -------------------- Root -------------------- */
 // Root (new) — return 200 so platform healthcheck passes

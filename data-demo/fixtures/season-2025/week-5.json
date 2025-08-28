@@ -1,0 +1,14 @@
+[
+  {
+    "id": "fixture_pompey_southampton",
+    "home": "pompey",
+    "away": "Southampton",
+    "kickoff_iso": "2025-08-28T01:36:00.000Z"
+  },
+  {
+    "id": "fixture_man_utd_qpr",
+    "home": "man utd",
+    "away": "QPR",
+    "kickoff_iso": "2025-08-28T01:36:00.000Z"
+  }
+]

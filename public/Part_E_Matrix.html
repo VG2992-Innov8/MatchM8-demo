@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Season Leaderboard — Weekly Matrix</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body class="page">
+  <div id="hero" data-page="Season — Weekly Matrix"></div>
+
+  <main class="container">
+    <section class="card">
+      <div class="row">
+        <label>Show last
+          <select id="window">
+            <option>5</option>
+            <option selected>10</option>
+            <option>15</option>
+          </select>
+          weeks</label>
+        <button id="refresh" class="btn">Refresh</button>
+      </div>
+
+      <div id="meta" class="muted"></div>
+      <div class="table-wrap">
+        <table id="matrix" class="table">
+          <thead></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="/hero.js"></script>
+  <script type="module">
+    async function fetchMatrix(windowSize) {
+      const r = await fetch(`/api/scores/leaderboard/matrix?window=${windowSize}`);
+      if (!r.ok) throw new Error('API failed');
+      return r.json();
+    }
+
+    function renderMatrix(data) {
+      const thead = document.querySelector('#matrix thead');
+      const tbody = document.querySelector('#matrix tbody');
+      thead.innerHTML = ''; tbody.innerHTML = '';
+
+      const weeks = data.weeks; // e.g., [8,9,10,11,12]
+      const head = document.createElement('tr');
+      head.innerHTML = `
+        <th style="width:72px">Rank</th>
+        <th>Player</th>
+        ${weeks.map(w => `<th class="right">Wk ${w}</th>`).join('')}
+        <th class="right">Total</th>
+      `;
+      thead.appendChild(head);
+
+      for (const row of data.rows) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td class="right">${row.rank}</td>
+          <td>${row.name}</td>
+          ${weeks.map(w => `<td class="right">${row.weekly[w] ?? 0}</td>`).join('')}
+          <td class="right"><b>${row.total}</b></td>
+        `;
+        tbody.appendChild(tr);
+      }
+
+      const meta = document.getElementById('meta');
+      meta.textContent = weeks.length
+        ? `Showing weeks ${weeks[0]}–${weeks[weeks.length - 1]} (season-to-date totals)`
+        : 'No weeks found yet.';
+    }
+
+    async function boot() {
+      const sel = document.getElementById('window');
+      const load = async () => {
+        const data = await fetchMatrix(sel.value);
+        renderMatrix(data);
+      };
+      document.getElementById('refresh').addEventListener('click', load);
+      await load();
+    }
+    boot().catch(err => alert(err.message));
+  </script>
+</body>
+</html>

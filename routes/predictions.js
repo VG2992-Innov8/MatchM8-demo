@@ -1,16 +1,71 @@
-// routes/predictions.js — map storage + server-side per-match/first-kickoff locking
+// routes/predictions.js — map storage + server-side locking (first_kickoff / per_match)
+
 const express = require('express');
 const path = require('path');
 const fsp = require('fs/promises');
-
-// ADD: TZ-aware lock helpers
-const { isLocked, earliestKickoff, kickoffToLock } = require('../lib/time');
+const fs = require('fs');
+const { DATA_DIR } = require('../lib/paths');
 
 const router = express.Router();
 router.use(express.json());
 
-const DATA    = path.join(__dirname, '..', 'data');
-const FIXDIR  = path.join(DATA, 'fixtures', 'season-2025');
+// ---------- Robust lock-status import (with graceful fallback) ----------
+let computeLockStatus;
+try {
+  const timeMod = require('../lib/time'); // supports multiple export styles
+  if (typeof timeMod === 'function') {
+    computeLockStatus = timeMod;                    // module.exports = function (...)
+  } else if (typeof timeMod?.computeLockStatus === 'function') {
+    computeLockStatus = timeMod.computeLockStatus;  // { computeLockStatus }
+  } else if (typeof timeMod?.computeLockMoment === 'function') {
+    // shim using older export name
+    computeLockStatus = (fixtures = [], cfg = {}) => {
+      const mins = Number(cfg.lock_mins ?? cfg.lock_minutes_before_kickoff ?? 0);
+      const utc = firstKickoffUTC(fixtures);
+      if (!utc) return { mode: 'first_kickoff', weekLocked: false, weekLockAtISO: null };
+      const lockAt = new Date(new Date(utc).getTime() - mins * 60000);
+      return {
+        mode: 'first_kickoff',
+        weekLocked: Date.now() >= lockAt.getTime(),
+        weekLockAtISO: lockAt.toISOString()
+      };
+    };
+  }
+} catch (_) { /* fall back below */ }
+
+// fallback implementation (covers both modes)
+if (typeof computeLockStatus !== 'function') {
+  computeLockStatus = (fixtures = [], cfg = {}) => {
+    const mode = (cfg.deadline_mode || 'first_kickoff').toLowerCase();
+    const mins = Number(cfg.lock_mins ?? cfg.lock_minutes_before_kickoff ?? 0);
+
+    if (mode === 'per_match') {
+      const map = {};
+      for (const m of Array.isArray(fixtures) ? fixtures : []) {
+        const id = String(m.id ?? m.matchId ?? m.code ?? '').trim();
+        if (!id) continue;
+        const ko = parseKickoff(m);
+        if (!ko) { map[id] = { locked: false, lockAtISO: null }; continue; }
+        const lockAt = new Date(ko.getTime() - mins * 60000);
+        map[id] = { locked: Date.now() >= lockAt.getTime(), lockAtISO: lockAt.toISOString() };
+      }
+      return { mode: 'per_match', map };
+    }
+
+    // first_kickoff default
+    const utc = firstKickoffUTC(fixtures);
+    if (!utc) return { mode: 'first_kickoff', weekLocked: false, weekLockAtISO: null };
+    const lockAt = new Date(new Date(utc).getTime() - mins * 60000);
+    return {
+      mode: 'first_kickoff',
+      weekLocked: Date.now() >= lockAt.getTime(),
+      weekLockAtISO: lockAt.toISOString()
+    };
+  };
+}
+
+// ---------- Paths & helpers ----------
+const DATA    = DATA_DIR;
 const PREDDIR = path.join(DATA, 'predictions');
 const CONFIG  = path.join(DATA, 'config.json');
 
@@ -19,31 +74,32 @@ const weekFile = (dir, w) => path.join(dir, `week-${w}.json`);
 async function readJson(file, fb) { try { return JSON.parse(await fsp.readFile(file, 'utf8')); } catch { return fb; } }
 async function writeJson(file, obj) { await fsp.mkdir(path.dirname(file), { recursive: true }); await fsp.writeFile(file, JSON.stringify(obj, null, 2)); }
 
-async function loadConfig() {
+function loadConfigSync() {
   const defaults = {
     season: 2025,
     total_weeks: 38,
     current_week: 1,
-    // both keys tolerated; normalize below
     lock_minutes_before_kickoff: 10,
     lock_mins: undefined,
     deadline_mode: 'first_kickoff',
     timezone: 'Australia/Melbourne',
   };
-  return { ...defaults, ...(await readJson(CONFIG, {})) };
+  try {
+    const raw = fs.readFileSync(CONFIG, 'utf8');
+    return { ...defaults, ...JSON.parse(raw) };
+  } catch {
+    return defaults;
+  }
 }
 
 function normalizeConfig(cfg) {
-  // computeLockStatus expects lock_mins, deadline_mode, timezone
   const lock_mins = cfg.lock_mins ?? cfg.lock_minutes_before_kickoff ?? 0;
   const deadline_mode = (cfg.deadline_mode || 'first_kickoff').toLowerCase();
   const timezone = cfg.timezone || 'UTC';
   return { ...cfg, lock_mins, deadline_mode, timezone };
 }
 
-// ---- normalize helpers ----
-
-// Accept either array or map from disk and return a MAP shape
+// Accept either array or map from disk; always return MAP shape
 function toMapShape(raw) {
   if (raw && typeof raw === 'object' && !Array.isArray(raw)) return raw; // already map
   if (Array.isArray(raw)) {
@@ -81,7 +137,6 @@ function clampInt(v, min, fb) {
   const n = parseInt(v, 10);
   if (!Number.isFinite(n)) return fb;
   const c = Math.max(min, n);
-  // hard upper guard so folks don't type 999
   return Math.min(99, c);
 }
 
@@ -92,7 +147,24 @@ function mergePreds(existingArr, incomingArr) {
   return Array.from(byId.values());
 }
 
-// ---- routes ----
+// Kickoff parsing utilities
+function parseKickoff(m) {
+  const keys = ['kickoff_utc', 'kickoffUTC', 'kickoffISO', 'kickoff_iso', 'utcDate', 'kickoff'];
+  for (const k of keys) {
+    const v = m?.[k];
+    if (!v) continue;
+    const d = new Date(v);
+    if (!isNaN(d)) return d;
+  }
+  return null;
+}
+function firstKickoffUTC(fixtures) {
+  const times = (Array.isArray(fixtures) ? fixtures : []).map(parseKickoff).filter(Boolean);
+  if (!times.length) return null;
+  return new Date(Math.min(...times)).toISOString();
+}
+
+// ---------- Routes ----------
 
 // Always returns a MAP: { player_id: { player_id, predictions, submitted_at, email_sent_at }, ... }
 router.get('/', async (req, res) => {
@@ -105,7 +177,6 @@ router.get('/', async (req, res) => {
   return res.json(toMapShape(raw));
 });
 
-// Handy: return just *this user's* predictions for a week
 // GET /api/predictions/mine?week=N  (header x-player-id also accepted)
 router.get('/mine', async (req, res) => {
   res.set('Cache-Control', 'no-store, max-age=0');
@@ -124,9 +195,6 @@ router.get('/mine', async (req, res) => {
 });
 
 // body: { week, predictions:[{id,home,away}], player_id? }  (header: x-player-id supported)
-// - Enforces locking
-// - Merges with existing predictions (partial saves won't wipe others)
-// - Returns acceptedIds / skippedIds and lock info
 router.post('/', async (req, res) => {
   const { week, predictions } = req.body || {};
   let { player_id } = req.body || {};
@@ -134,39 +202,29 @@ router.post('/', async (req, res) => {
 
   if (!Number.isFinite(w) || w <= 0) return res.status(400).json({ error: 'week required' });
 
-  // ---- TZ-aware locking (first_kickoff) ----
-const cfg = normalizeConfig(await loadConfig());
-if (cfg.deadline_mode === 'first_kickoff') {
-  const firstKO = earliestKickoff(cfg.season, w); // reads fixtures/season-<season>/week-<w>.json
-  if (firstKO && isLocked(firstKO, cfg)) {
-    const lockUtc = kickoffToLock(firstKO, cfg.lock_minutes_before_kickoff, cfg.timezone);
-    return res.status(423).json({ ok: false, error: 'locked', lock_utc: lockUtc });
-  }
-}
-// -------------------------------------------
-
   // find a player id (body → header → fallback)
   player_id = String(player_id || req.get('x-player-id') || '').trim();
-  if (!player_id) {
-    player_id = `anon-${Date.now()}`; // soft fallback
-  }
+  if (!player_id) player_id = `anon-${Date.now()}`;
 
   // Normalize incoming predictions
   const incoming = normIncomingPreds(predictions);
   if (!incoming.length) return res.status(400).json({ error: 'predictions must be a non-empty array with {id,home,away}' });
 
   // Load config + fixtures and compute locking
-  const cfgRaw = await loadConfig();
-  const config = normalizeConfig(cfgRaw);
-  const fixtures = await readJson(weekFile(FIXDIR, w), []);
-  const lockStatus = computeLockStatus(fixtures, config);
+  const cfg = normalizeConfig(loadConfigSync());
+  const fixturesBase = path.join(DATA, 'fixtures', `season-${cfg.season || 2025}`);
+  const fixtures =
+       await readJson(path.join(fixturesBase, `week-${w}.json`), null)
+    ?? await readJson(path.join(fixturesBase, 'weeks', `week-${w}.json`), []);
 
-  // Enforce locking:
+  const lockStatus = computeLockStatus(fixtures, cfg);
+
+  // Enforce locking (first_kickoff)
   if (lockStatus.mode === 'first_kickoff' && lockStatus.weekLocked) {
     return res.status(423).json({
       error: 'week_locked',
       message: 'This week is locked (first kickoff passed).',
-      weekLockAtISO: lockStatus.weekLockAtISO
+      weekLockAtISO: lockStatus.weekLockAtISO ?? null
     });
   }
 
@@ -178,7 +236,7 @@ if (cfg.deadline_mode === 'first_kickoff') {
   if (lockStatus.mode === 'per_match') {
     for (const p of incoming) {
       const mid = String(p.id);
-      const entry = lockStatus.map[mid];
+      const entry = lockStatus.map?.[mid];
       if (entry?.locked) skippedIds.push(mid);
       else { accepted.push(p); acceptedIds.push(mid); }
     }

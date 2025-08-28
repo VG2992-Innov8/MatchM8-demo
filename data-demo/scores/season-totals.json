@@ -1,0 +1,26 @@
+[
+  {
+    "player_id": "1756199966655",
+    "player": "",
+    "totalPoints": 2,
+    "weeksPlayed": 1
+  },
+  {
+    "player_id": "1de47655-3eb5-42d5-921a-47805f84f1a1",
+    "player": "",
+    "totalPoints": 0,
+    "weeksPlayed": 1
+  },
+  {
+    "player_id": "46db7276-59dd-46ef-866e-acb96fccfc69",
+    "player": "Toby",
+    "totalPoints": 0,
+    "weeksPlayed": 0
+  },
+  {
+    "player_id": "58f1fdb8-9199-4e61-8403-95742205e909",
+    "player": "Vince",
+    "totalPoints": 0,
+    "weeksPlayed": 0
+  }
+]

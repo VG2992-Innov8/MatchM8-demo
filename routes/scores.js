@@ -1,12 +1,16 @@
 // routes/scores.js — robust scorer (supports old & new predictions shapes)
+
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
+const fsp = require('fs/promises');
+const { DATA_DIR } = require('../lib/paths');
 
 const router = express.Router();
 router.use(express.json());
 
-const DATA      = path.join(__dirname, '..', 'data');
+// Directories inside the active DATA_DIR (demo/prod aware)
+const DATA      = DATA_DIR;
 const PRED_DIR  = path.join(DATA, 'predictions');
 const RES_DIR   = path.join(DATA, 'results');
 const SCO_DIR   = path.join(DATA, 'scores');
@@ -153,7 +157,7 @@ function rebuildSeasonTotalsFromWeeks() {
         totals.set(pid, cur);
       }
     }
-  } catch (e) {
+  } catch {
     // ignore — we'll still merge players below
   }
 
@@ -314,7 +318,16 @@ router.get('/summary', (req, res) => {
 });
 
 // ---- Player week breakdown: predictions + results + per-match points
-const FIXT_DIR = path.join(DATA, 'fixtures', 'season-2025');
+
+function readConfig() {
+  const cfgPath = path.join(DATA, 'config.json');
+  try {
+    const raw = fs.readFileSync(cfgPath, 'utf8');
+    return JSON.parse(raw);
+  } catch {
+    return { season: 2025 };
+  }
+}
 
 function normaliseFixtures(any) {
   const out = new Map();
@@ -359,9 +372,14 @@ router.get('/player-week', (req, res) => {
   }
   if (!playerId) return res.status(400).json({ ok: false, error: 'player_id or name required' });
 
+  const cfg = readConfig();
+  const fxBase = path.join(DATA, 'fixtures', `season-${cfg.season || 2025}`);
+  const fixturesRaw =
+      readJson(path.join(fxBase, `week-${week}.json`), null)
+   ?? readJson(path.join(fxBase, 'weeks', `week-${week}.json`), null);
+
   const predsRaw   = readJson(path.join(PRED_DIR, `week-${week}.json`), null);
   const resultsRaw = readJson(path.join(RES_DIR,  `week-${week}.json`), null);
-  const fixturesRaw= readJson(path.join(FIXT_DIR, `week-${week}.json`), null);
 
   const predMap  = normalisePredictions(predsRaw);
   const results  = normaliseResults(resultsRaw);
@@ -413,6 +431,94 @@ router.get('/player-week', (req, res) => {
     rows,
     totals: { weekPoints, exactCount, outcomeCount, pendingCount, missedCount }
   });
+});
+
+/* ---------- Weekly Matrix (per-week points + season total) ---------- */
+// GET /api/scores/leaderboard/matrix?window=5&endWeek=auto
+router.get('/leaderboard/matrix', async (req, res) => {
+  try {
+    const WEEKS_DIR  = path.join(SCO_DIR, 'weeks');
+
+    // list available week-N.json files
+    const files = await fsp.readdir(WEEKS_DIR).catch(() => []);
+    const weekNums = files
+      .map(f => (f.match(/^week-(\d+)\.json$/) || [])[1])
+      .filter(Boolean)
+      .map(n => parseInt(n, 10))
+      .sort((a, b) => a - b);
+
+    if (weekNums.length === 0) {
+      return res.json({ weeks: [], rows: [] });
+    }
+
+    const window   = Math.max(1, Math.min(parseInt(req.query.window, 10) || 5, 38));
+    const endWeek  = req.query.endWeek ? parseInt(req.query.endWeek, 10) : weekNums[weekNums.length - 1];
+    const startWeek = Math.max(1, endWeek - window + 1);
+    const selectedWeeks = weekNums.filter(w => w >= startWeek && w <= endWeek);
+
+    // read a week file and normalise shape
+    async function readWeek(w) {
+      const p = path.join(WEEKS_DIR, `week-${w}.json`);
+      const json = JSON.parse(await fsp.readFile(p, 'utf8'));
+
+      const mapRow = (r) => ({
+        player_id: r.player_id ?? r.id ?? r.player ?? r.name,
+        name:      r.name ?? String(r.player ?? r.player_id ?? r.id),
+        points:    Number(r.weekPoints ?? r.points ?? r.total ?? r.score ?? 0),
+      });
+
+      if (Array.isArray(json)) return json.map(mapRow);
+      if (Array.isArray(json.players)) return json.players.map(mapRow);
+      if (Array.isArray(json.scores))  return json.scores.map(mapRow);
+      return [];
+    }
+
+    // build player maps
+    const players = new Map();      // id -> name
+    const perWeek = new Map();      // id -> { [week]: pts }
+
+    for (const w of selectedWeeks) {
+      const rows = await readWeek(w);
+      for (const r of rows) {
+        const id = String(r.player_id ?? r.name);
+        players.set(id, r.name ?? id);
+        if (!perWeek.has(id)) perWeek.set(id, {});
+        perWeek.get(id)[w] = r.points || 0;
+      }
+    }
+
+    // totals up to endWeek (season-to-date)
+    const totalsToDate = new Map();
+    for (const id of players.keys()) {
+      let total = 0;
+      for (const w of weekNums) {
+        if (w > endWeek) break;
+        total += perWeek.get(id)?.[w] ?? 0;
+      }
+      totalsToDate.set(id, total);
+    }
+
+    // rows + rank
+    const rows = [...players.keys()].map(id => ({
+      player_id: id,
+      name: players.get(id),
+      weekly: Object.fromEntries(selectedWeeks.map(w => [w, perWeek.get(id)?.[w] ?? 0])),
+      total: totalsToDate.get(id) || 0,
+    }));
+
+    rows.sort((a, b) => b.total - a.total || a.name.localeCompare(b.name));
+    let last = null, rank = 0, seen = 0;
+    for (const r of rows) {
+      seen += 1;
+      if (r.total !== last) { rank = seen; last = r.total; }
+      r.rank = rank;
+    }
+
+    res.json({ startWeek, endWeek, weeks: selectedWeeks, rows });
+  } catch (err) {
+    console.error('leaderboard/matrix error', err);
+    res.status(500).json({ error: 'leaderboard matrix failed', details: String(err) });
+  }
 });
 
 module.exports = router;

@@ -1,164 +1,349 @@
 ﻿<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Season — MatchM8</title>
-  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/styles.css" />
   <style>
-  /* Only affects Season page if you set data-page="Season" on the hero */
-  #hero[data-page="Season"] #btnPreview,
-  #hero[data-page="Season"] [data-role="preview"] {
-    display: none !important;
-  }
-</style>
+    /* Hide any shared "Preview" controls on this page */
+    #hero[data-page="Season"] #btnPreview,
+    #hero[data-page="Season"] [data-role="preview"] { display:none !important; }
 
+    .controls { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+    .muted { color: var(--muted); font-size:.95rem; }
+    .right { text-align:right; }
+    .clickable { cursor:pointer; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+
+    /* Simple modal */
+    #modalOverlay {
+      position: fixed; inset: 0; background: rgba(0,0,0,.35);
+      display:none; align-items: center; justify-content: center; z-index: 1000;
+    }
+    #modalCard {
+      background: #fff; color: #222; width: min(900px, 96vw);
+      max-height: 85vh; overflow: auto; border-radius: 8px;
+      box-shadow: 0 10px 30px rgba(0,0,0,.25);
+    }
+    #modalHead {
+      padding: 14px 16px; border-bottom: 1px solid #ddd;
+      display:flex; align-items:center; justify-content: space-between;
+    }
+    #modalBody { padding: 12px 16px 18px; }
+    .modal-close { border:0; background: transparent; font-size: 18px; cursor:pointer; }
+    .subtle { color: #666; font-size: .92rem; }
+    .mini { font-size: .9rem; }
+    .table.compact td, .table.compact th { padding: 6px 8px; }
+  </style>
 </head>
 <body>
   <div id="hero" data-page="Season"></div>
   <script src="/hero.js" defer></script>
 
-  <main class="container narrow">
-    <div class="panel" style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
-      <div class="center" style="gap:8px;flex-wrap:wrap">
+  <main class="container wide">
+    <div class="panel controls" style="justify-content:space-between">
+      <div class="controls">
+        <label>Show last
+          <select id="selWindow" class="input">
+            <option value="5">5</option>
+            <option value="8">8</option>
+            <option value="10" selected>10</option>
+          </select>
+          weeks
+        </label>
         <button id="btnRefresh" class="btn">Refresh</button>
         <button id="btnCSV" class="btn">Download CSV</button>
       </div>
-      <div id="meta" style="color:var(--muted);font-size:.95rem"></div>
+      <div id="meta" class="muted"></div>
     </div>
 
     <div class="panel">
       <table class="table" id="tbl">
-        <thead>
-          <tr>
-            <th style="width:72px">Rank</th>
-            <th>Player</th>
-            <th class="right">Total Points</th>
-            <th class="right">Weeks Played</th>
-          </tr>
-        </thead>
+        <thead></thead>
         <tbody></tbody>
       </table>
-      <div id="empty" style="padding:8px;color:var(--muted);display:none">
-        No season totals yet. Finalise at least one week on the Scoring page.
+      <div id="empty" class="muted" style="padding:8px; display:none">
+        No season data yet. Finalise at least one week on the Scoring page.
       </div>
     </div>
   </main>
 
+  <!-- Modal -->
+  <div id="modalOverlay" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <div id="modalCard">
+      <div id="modalHead">
+        <div>
+          <div id="modalTitle" class="mono" style="font-weight:600"></div>
+          <div id="modalSub" class="subtle"></div>
+        </div>
+        <button id="modalClose" class="modal-close" aria-label="Close">✕</button>
+      </div>
+      <div id="modalBody"></div>
+    </div>
+  </div>
+
   <script>
-  const $ = s => document.querySelector(s);
-  const tbody = $('#tbl tbody');
-  const empty = $('#empty');
-  const meta  = $('#meta');
+  (function(){
+    var $ = function(s){ return document.querySelector(s); };
+    var thead = $('#tbl thead');
+    var tbody = $('#tbl tbody');
+    var meta  = $('#meta');
+    var empty = $('#empty');
+    var selWindow = $('#selWindow');
 
-  // Normalise API shapes:
-  //  - Preferred: { seasonTotals: [{ player/name, totalPoints/weeksPlayed, ... }] }
-  //  - Fallbacks: array or legacy map (defensive)
-  function normaliseSeason(payload) {
-    let arr = Array.isArray(payload?.seasonTotals) ? payload.seasonTotals : payload;
+    // Modal refs
+    var overlay = $('#modalOverlay');
+    var modalTitle = $('#modalTitle');
+    var modalSub = $('#modalSub');
+    var modalBody = $('#modalBody');
 
-    const rows = [];
-    if (Array.isArray(arr)) {
-      for (const r of arr) {
-        rows.push({
-          name: String(r.player ?? r.name ?? '').trim(),
-          total: Number(r.totalPoints ?? r.total ?? 0),
-          weeks: Number(r.weeksPlayed ?? r.weeks_played ?? 0),
+    // cache for /player-week lookups: key = pid:week
+    var pwCache = new Map();
+
+    // Persist chosen window
+    (function initWindow(){
+      var saved = localStorage.getItem('season_window');
+      if (saved && selWindow.querySelector('option[value="' + saved + '"]')) selWindow.value = saved;
+    })();
+
+    function normaliseMatrix(payload) {
+      var weeks = Array.isArray(payload && payload.weeks) ? payload.weeks.slice().sort(function(a,b){return a-b;}) : [];
+      var rows = Array.isArray(payload && payload.rows) ? payload.rows : [];
+      rows = rows.map(function(r){
+        return {
+          id: String(r.player_id != null ? r.player_id : (r.id != null ? r.id : (r.name != null ? r.name : ''))).trim(),
+          name: String(r.name != null ? r.name : (r.player != null ? r.player : (r.player_id != null ? r.player_id : ''))).trim(),
+          total: Number(r.total != null ? r.total : (r.totalPoints != null ? r.totalPoints : 0)),
+          rank: (typeof r.rank === 'number' && isFinite(r.rank)) ? r.rank : null,
+          weekly: (r.weekly && typeof r.weekly === 'object') ? r.weekly : {}
+        };
+      });
+      if (!rows.every(function(r){ return typeof r.rank === 'number' && isFinite(r.rank); })) {
+        rows.sort(function(a,b){ return (b.total - a.total) || a.name.localeCompare(b.name); });
+        var last = null, seen = 0, rank = 0;
+        rows.forEach(function(r){
+          seen += 1;
+          if (r.total !== last){ rank = seen; last = r.total; }
+          r.rank = rank;
         });
+      } else {
+        rows.sort(function(a,b){ return (a.rank - b.rank) || a.name.localeCompare(b.name); });
       }
-    } else if (arr && typeof arr === 'object') {
-      for (const [, v] of Object.entries(arr)) {
-        rows.push({
-          name: String(v?.name ?? '').trim(),
-          total: Number(v?.total ?? 0),
-          weeks: Number(v?.weeks_played ?? 0),
-        });
-      }
+      return { weeks: weeks, rows: rows };
     }
-    rows.sort((a, b) => (b.total - a.total) || a.name.localeCompare(b.name));
-    return rows;
+
+     function buildHeader(weeks) {
+    var weekCols = weeks.map(function(w){
+      return '<th class="right mono">WK ' + w + ' PTS</th>';
+    }).join('');
+    thead.innerHTML =
+        '<tr>'
+      +   '<th style="width:72px">Rank</th>'
+      +   '<th>Player</th>'
+      +    weekCols
+      +   '<th class="right">Season Total</th>'
+      + '</tr>';
   }
 
-  function render(rows, updatedAtISO) {
-    tbody.innerHTML = '';
-    if (!rows.length) {
-      empty.style.display = 'block';
-      meta.textContent = `Players: 0`;
-      return;
+    function renderMatrix(data) {
+      buildHeader(data.weeks);
+      tbody.innerHTML = data.rows.map(function(r){
+        var weekCells = data.weeks.map(function(w){
+          var pts = Number(r.weekly && r.weekly[w] != null ? r.weekly[w] : 0);
+          return '<td class="right mono clickable" title="Click for details" data-pid="' + r.id + '" data-pname="' + (r.name||'') + '" data-week="' + w + '">' + pts + '</td>';
+        }).join('');
+        return ''
+          + '<tr data-pid="' + r.id + '">'
+          +   '<td>' + r.rank + '</td>'
+          +   '<td>' + (r.name || '&nbsp;') + '</td>'
+          +    weekCells
+          +   '<td class="right">' + r.total + '</td>'
+          + '</tr>';
+      }).join('');
+      meta.textContent = 'Players: ' + data.rows.length + ' · Updated: ' + new Date().toLocaleString();
     }
-    empty.style.display = 'none';
 
-    // Dense ranking (1,2,2,4 …)
-    let rank = 0, lastPts = null, shown = 0;
-    rows.forEach(r => {
-      rank++;
-      if (r.total !== lastPts) { shown = rank; lastPts = r.total; }
-      const tr = document.createElement('tr');
-      tr.innerHTML = `
-        <td>${shown}</td>
-        <td>${r.name || '&nbsp;'}</td>
-        <td class="right">${Number.isFinite(r.total) ? r.total : ''}</td>
-        <td class="right">${Number.isFinite(r.weeks) ? r.weeks : ''}</td>
-      `;
-      tbody.appendChild(tr);
+    async function loadMatrix() {
+      var win = parseInt(selWindow.value, 10) || 10;
+      localStorage.setItem('season_window', String(win));
+      try {
+        var url = '/api/scores/leaderboard/matrix?window=' + win + '&t=' + Date.now();
+        var res = await fetch(url, { cache: 'no-store' });
+        if (!res.ok) throw new Error(String(res.status));
+        var json = await res.json().catch(function(){ return {}; });
+        var data = normaliseMatrix(json);
+        if (!data.weeks.length || !data.rows.length) {
+          thead.innerHTML = '';
+          tbody.innerHTML = '';
+          empty.style.display = 'block';
+          meta.textContent = 'Players: 0';
+          return;
+        }
+        empty.style.display = 'none';
+        renderMatrix(data);
+      } catch (_e) {
+        thead.innerHTML = '';
+        tbody.innerHTML = '';
+        empty.style.display = 'block';
+        meta.textContent = 'Players: 0';
+      }
+    }
+
+    // ---- Modal helpers ----
+    function openModal(title, sub, bodyHTML) {
+      modalTitle.textContent = title;
+      modalSub.textContent = sub || '';
+      modalBody.innerHTML = bodyHTML || '';
+      overlay.style.display = 'flex';
+      document.body.style.overflow = 'hidden';
+    }
+    function closeModal() {
+      overlay.style.display = 'none';
+      modalBody.innerHTML = '';
+      document.body.style.overflow = '';
+    }
+    $('#modalClose').addEventListener('click', closeModal);
+    overlay.addEventListener('click', function(e){ if (e.target === overlay) closeModal(); });
+    window.addEventListener('keydown', function(e){ if (e.key === 'Escape') closeModal(); });
+
+    function normalisePlayerWeek(json) {
+      // expects { ok, week, player:{id,name}, rows:[{homeTeam,awayTeam,prediction?,result?,points?}], totals:{...} }
+      var out = { ok:false, week:null, player:{ id:'', name:'' }, rows:[], totals:{} };
+      if (!json || typeof json !== 'object') return out;
+      out.ok = !!json.ok;
+      out.week = json.week || null;
+      out.player = {
+        id: String(json.player && json.player.id || ''),
+        name: String(json.player && json.player.name || '')
+      };
+      out.totals = json.totals || {};
+      var rows = Array.isArray(json.rows) ? json.rows : [];
+      out.rows = rows.map(function(r){
+        var pred = r.prediction ? { home: Number(r.prediction.home||0), away: Number(r.prediction.away||0) } : null;
+        var res  = r.result     ? { home: Number(r.result.home||0),     away: Number(r.result.away||0)     } : null;
+        var pts  = (typeof r.points === 'number' && isFinite(r.points)) ? r.points : null;
+        return {
+          homeTeam: String(r.homeTeam || 'Home'),
+          awayTeam: String(r.awayTeam || 'Away'),
+          prediction: pred,
+          result: res,
+          points: pts
+        };
+      });
+      return out;
+    }
+
+    function renderPlayerWeekModal(pw) {
+      var head = '<div class="mini subtle" style="margin:4px 0 10px">exact '
+               + (pw.totals.exactCount||0) + ' · outcome ' + (pw.totals.outcomeCount||0)
+               + ' · pending ' + (pw.totals.pendingCount||0)
+               + ' · missed ' + (pw.totals.missedCount||0)
+               + ' · week points ' + (pw.totals.weekPoints||0) + '</div>';
+
+      var rowsHTML = pw.rows.map(function(r){
+        var pred = r.prediction ? (r.prediction.home + '-' + r.prediction.away) : '';
+        var res  = r.result ? (r.result.home + '-' + r.result.away) : '';
+        var pts  = (r.points == null ? '' : r.points);
+        return '<tr>'
+             +   '<td class="mono">' + r.homeTeam + '</td>'
+             +   '<td class="mono">' + r.awayTeam + '</td>'
+             +   '<td class="right mono">' + pred + '</td>'
+             +   '<td class="right mono">' + res + '</td>'
+             +   '<td class="right mono">' + pts + '</td>'
+             + '</tr>';
+      }).join('');
+
+      var table =
+          '<table class="table compact">'
+        +   '<thead><tr>'
+        +     '<th>Home</th><th>Away</th>'
+        +     '<th class="right">Prediction</th>'
+        +     '<th class="right">Result</th>'
+        +     '<th class="right">Pts</th>'
+        +   '</tr></thead>'
+        +   '<tbody>' + rowsHTML + '</tbody>'
+        + '</table>';
+
+      return head + table;
+    }
+
+    async function loadPlayerWeek(pid, week) {
+      var key = pid + ':' + week;
+      if (pwCache.has(key)) return pwCache.get(key);
+      var url = '/api/scores/player-week?week=' + week + '&player_id=' + encodeURIComponent(pid);
+      var res = await fetch(url, { cache: 'no-store' });
+      var json = await res.json().catch(function(){ return {}; });
+      var norm = normalisePlayerWeek(json);
+      pwCache.set(key, norm);
+      return norm;
+    }
+
+    // Click handler: open modal on week cell
+    tbody.addEventListener('click', async function(e){
+      var td = e.target.closest('td[data-week][data-pid]');
+      if (!td) return;
+      var pid = td.getAttribute('data-pid');
+      var pname = td.getAttribute('data-pname') || '';
+      var week = parseInt(td.getAttribute('data-week'), 10);
+      if (!pid || !week) return;
+
+      // quick visual feedback
+      td.style.transform = 'scale(0.98)';
+      setTimeout(function(){ td.style.transform = ''; }, 100);
+
+      try {
+        var data = await loadPlayerWeek(pid, week);
+        var title = (pname || data.player.name || 'Player') + ' — Week ' + week;
+        var sub = '';
+        var body = '';
+        if (data && data.ok) {
+          sub = 'Predictions · Results · per-match points';
+          body = renderPlayerWeekModal(data);
+        } else {
+          body = '<div class="muted">No details available for this player/week.</div>';
+        }
+        openModal(title, sub, body);
+      } catch (_e) {
+        openModal('Details', '', '<div class="muted">Failed to load details.</div>');
+      }
     });
 
-    const updated = updatedAtISO ? new Date(updatedAtISO).toLocaleString() : new Date().toLocaleString();
-    meta.textContent = `Players: ${rows.length} · Updated: ${updated}`;
-  }
-
-  async function loadSeason() {
-    try {
-      const url = `/api/scores/summary?t=${Date.now()}`;
-      const res = await fetch(url, { cache: 'no-store' });
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-      const json = await res.json().catch(() => ({}));
-      const rows = normaliseSeason(json);
-      render(rows, json.updatedAtISO);
-    } catch (e) {
-      tbody.innerHTML = '';
-      empty.style.display = 'block';
-      meta.textContent = `Players: 0`;
+    function downloadCSV() {
+      var header = Array.from(thead.querySelectorAll('th')).map(function(th){ return (th.textContent || '').trim(); });
+      var body = Array.from(tbody.querySelectorAll('tr')).map(function(tr){
+        return Array.from(tr.querySelectorAll('td')).map(function(td){ return (td.textContent || '').trim(); });
+      });
+      if (!body.length) return;
+      var csv = [header].concat(body).map(function(cols){
+        return cols.map(function(v){
+          v = String(v);
+          return v.indexOf(',') >= 0 ? '"' + v.replace(/"/g,'""') + '"' : v;
+        }).join(',');
+      }).join('\r\n');
+      var blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'season-weekly-matrix.csv';
+      a.click();
+      URL.revokeObjectURL(a.href);
     }
-  }
 
-  function downloadCSV() {
-    // Build rows from the current table (so CSV mirrors the view)
-    const header = ['Rank','Player','Total Points','Weeks Played'];
-    const body = Array.from(tbody.querySelectorAll('tr')).map(tr =>
-      Array.from(tr.querySelectorAll('td')).map(td => td.textContent.trim())
-    );
-    if (!body.length) return;
-
-    const csv = [header, ...body].map(cols =>
-      cols.map(v => String(v).includes(',') ? `"${String(v).replace(/"/g,'""')}"` : v).join(',')
-    ).join('\r\n');
-
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = 'season-leaderboard.csv';
-    a.click();
-    URL.revokeObjectURL(a.href);
-  }
-
-  // Season page: remove any stray Preview controls injected by shared UI
-  document.addEventListener('DOMContentLoaded', () => {
-    const kill = (sel) => document.querySelectorAll(sel).forEach(el => el.remove());
-    kill('#btnPreview');
-    kill('[data-role="preview"]');
-    // last resort: remove any button whose visible text is "Preview"
-    document.querySelectorAll('button').forEach(btn => {
-      if ((btn.textContent || '').trim().toLowerCase() === 'preview') btn.remove();
+    // Remove any stray "Preview" controls injected by shared UI
+    document.addEventListener('DOMContentLoaded', function(){
+      document.querySelectorAll('#btnPreview,[data-role="preview"]').forEach(function(el){ el.remove(); });
+      document.querySelectorAll('button').forEach(function(b){
+        if ((b.textContent || '').trim().toLowerCase() === 'preview') b.remove();
+      });
     });
-  });
 
-  // Wire up
-  $('#btnRefresh').addEventListener('click', loadSeason);
-  $('#btnCSV').addEventListener('click', downloadCSV);
-  window.addEventListener('keydown', e => { if ((e.key || '').toLowerCase() === 'r') loadSeason(); });
+    $('#btnRefresh').addEventListener('click', loadMatrix);
+    $('#btnCSV').addEventListener('click', downloadCSV);
+    selWindow.addEventListener('change', loadMatrix);
+    window.addEventListener('keydown', function(e){ if ((e.key || '').toLowerCase() === 'r') loadMatrix(); });
 
-  loadSeason();
+    loadMatrix();
+  })();
   </script>
 </body>
 </html>
